@@ -1,288 +1,109 @@
 import { useStore } from '@nanostores/react'
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useEffect, useState } from 'react'
 
 import { useGatewayRequest } from '@/app/gateway/hooks/use-gateway-request'
+import { PetThumb } from '@/components/pet/pet-thumb'
 import { SegmentedControl } from '@/components/ui/segmented-control'
+import { useI18n } from '@/i18n'
 import { triggerHaptic } from '@/lib/haptics'
 import { Loader2, PawPrint, Trash2 } from '@/lib/icons'
 import { selectableCardClass } from '@/lib/selectable-card'
 import { cn } from '@/lib/utils'
-import { type PetInfo, setPetInfo } from '@/store/pet'
+import { $petInfo } from '@/store/pet'
+import {
+  $petBusy,
+  $petGallery,
+  $petGalleryError,
+  $petGalleryStatus,
+  adoptPet,
+  loadPetGallery,
+  loadPetThumb,
+  PET_SCALE_DEFAULT,
+  PET_SCALE_MAX,
+  PET_SCALE_MIN,
+  rankedGalleryPets,
+  removePet as removePetAction,
+  setPetEnabled,
+  setPetScale
+} from '@/store/pet-gallery'
 import { $gatewayState } from '@/store/session'
 
 import { ListRow, SectionHeading } from './primitives'
 
-/** A JSON-RPC "method not found" — the backend predates the pet RPCs. */
-function isMissingMethod(error: unknown): boolean {
-  const message = error instanceof Error ? error.message : String(error)
-
-  return /method not found|-32601|unknown method|no such method/i.test(message)
-}
-
-interface GalleryPet {
-  slug: string
-  displayName: string
-  installed: boolean
-  spritesheetUrl?: string
-  /** petdex's hand-picked/official set — the closest thing to "popular." */
-  curated?: boolean
-}
-
-// petdex frames are a fixed 192×208 grid; the box matches that aspect.
-const THUMB_W = 40
-const THUMB_H = Math.round((THUMB_W * 208) / 192)
-
-type ThumbLoader = (slug: string, url?: string) => Promise<string | null>
-
 /**
- * Idle-frame preview for one pet. The backend crops + caches the frame and
- * returns it as a same-origin data URI (`pet.thumb`), which dodges the renderer
- * CSP / R2 hotlink rules that break a direct `<img src=cdn>`. We only fire the
- * request once the thumb scrolls into view, so the picker never fetches the
- * whole catalog up front.
- */
-function PetThumb({ slug, url, alt, load }: { slug: string; url?: string; alt: string; load: ThumbLoader }) {
-  const [src, setSrc] = useState<string | null>(null)
-  const boxRef = useRef<HTMLSpanElement | null>(null)
-
-  useEffect(() => {
-    const el = boxRef.current
-
-    if (!el || src) {
-      return
-    }
-
-    const observer = new IntersectionObserver(
-      entries => {
-        if (entries.some(entry => entry.isIntersecting)) {
-          observer.disconnect()
-          void load(slug, url).then(uri => {
-            if (uri) {
-              setSrc(uri)
-            }
-          })
-        }
-      },
-      { rootMargin: '120px' }
-    )
-
-    observer.observe(el)
-
-    return () => observer.disconnect()
-  }, [slug, url, src, load])
-
-  return (
-    <span
-      className="grid shrink-0 place-items-center overflow-hidden rounded-md bg-(--ui-bg-tertiary) text-(--ui-text-tertiary)"
-      ref={boxRef}
-      style={{ height: THUMB_H, width: THUMB_W }}
-    >
-      {src ? (
-        <img
-          alt={alt}
-          aria-hidden
-          className="pointer-events-none size-full object-contain"
-          src={src}
-          style={{ imageRendering: 'pixelated' }}
-        />
-      ) : (
-        <PawPrint className="size-4" />
-      )}
-    </span>
-  )
-}
-
-interface PetGallery {
-  enabled: boolean
-  active: string
-  pets: GalleryPet[]
-}
-
-/**
- * Appearance opt-in for the floating petdex mascot. Reads the gallery + current
- * config via `pet.gallery`, adopts a pet with `pet.select` (installs on demand),
- * and toggles off with `pet.disable`. The floating mascot polls `pet.info`, so
- * picking a pet here lights it up within a couple seconds — no reload, no CLI.
+ * Appearance opt-in for the floating petdex mascot. A thin view over the shared
+ * `pet-gallery` store — it subscribes to the atoms and calls the store actions,
+ * so the gallery is fetched once + cached and adopt/toggle/remove patch local
+ * state instead of re-pulling the network gallery. The floating mascot polls
+ * `pet.info`, so picking a pet here lights it up within a couple seconds.
  */
 export function PetSettings() {
+  const { t } = useI18n()
+  const copy = t.settings.appearance.pet
   const { requestGateway } = useGatewayRequest()
   const gatewayState = useStore($gatewayState)
-  const [gallery, setGallery] = useState<PetGallery | null>(null)
-  const [busySlug, setBusySlug] = useState<string | null>(null)
-  const [error, setError] = useState<string | null>(null)
-  const [staleBackend, setStaleBackend] = useState(false)
+  const gallery = useStore($petGallery)
+  const status = useStore($petGalleryStatus)
+  const error = useStore($petGalleryError)
+  const busySlug = useStore($petBusy)
+  const petInfo = useStore($petInfo)
   const [query, setQuery] = useState('')
-
-  // Dedupe thumb requests per slug (across re-renders and re-filters); the
-  // backend also disk-caches, so a slug is fetched at most once per session.
-  const thumbCache = useRef<Map<string, Promise<string | null>>>(new Map())
-
-  const loadThumb = useCallback<ThumbLoader>(
-    (slug, url) => {
-      const cache = thumbCache.current
-      let pending = cache.get(slug)
-
-      if (!pending) {
-        pending = requestGateway<{ ok: boolean; dataUri?: string }>('pet.thumb', { slug, url: url ?? '' })
-          .then(result => (result?.ok && result.dataUri ? result.dataUri : null))
-          .catch(() => null)
-        cache.set(slug, pending)
-      }
-
-      return pending
-    },
-    [requestGateway]
-  )
-
-  const RESTART_HINT =
-    'Pets need a quick restart — the running app started before this feature was added. Quit and reopen Hermes, then come back here.'
-
-  const refresh = useCallback(async () => {
-    try {
-      // Pull the picker state AND push the live mascot state into the shared
-      // `$petInfo` store, so the floating pet reflects a change/disable here
-      // immediately instead of clinging to its cached sprite.
-      const [next, info] = await Promise.all([
-        requestGateway<PetGallery>('pet.gallery'),
-        requestGateway<PetInfo>('pet.info')
-      ])
-
-      if (next) {
-        setGallery(next)
-        setStaleBackend(false)
-      }
-
-      if (info) {
-        setPetInfo(info)
-      }
-    } catch (e) {
-      if (isMissingMethod(e)) {
-        setStaleBackend(true)
-      }
-      // otherwise cosmetic — leave the picker as-is on a transient hiccup
-    }
-  }, [requestGateway])
+  const scale = petInfo.scale ?? PET_SCALE_DEFAULT
 
   useEffect(() => {
     if (gatewayState !== 'open') {
       return
     }
 
-    void refresh()
-  }, [gatewayState, refresh])
+    void loadPetGallery(requestGateway)
+  }, [gatewayState, requestGateway])
 
   const enabled = gallery?.enabled ?? false
   const active = gallery?.active ?? ''
   const pets = gallery?.pets ?? []
+  const staleBackend = status === 'stale'
 
-  // Every mutation shares the same shape: spin the row, fire the RPC, resync.
-  // A missing method means a stale backend; anything else is a real error.
-  const runPetRpc = useCallback(
-    async (method: string, slug: string, failMsg: string) => {
-      setBusySlug(slug)
-      setError(null)
+  const selectPet = (slug: string) => {
+    void adoptPet(requestGateway, slug, copy.adoptFailed(slug)).then(ok => ok && triggerHaptic('crisp'))
+  }
 
-      try {
-        await requestGateway(method, slug ? { slug } : undefined)
-        triggerHaptic('crisp')
-        await refresh()
-      } catch (e) {
-        if (isMissingMethod(e)) {
-          setStaleBackend(true)
-        } else {
-          setError(e instanceof Error ? e.message : failMsg)
-        }
-      } finally {
-        setBusySlug(null)
-      }
-    },
-    [refresh, requestGateway]
-  )
+  const removePet = (slug: string) => {
+    void removePetAction(requestGateway, slug, copy.uninstallFailed(slug)).then(ok => ok && triggerHaptic('crisp'))
+  }
 
-  const selectPet = useCallback((slug: string) => runPetRpc('pet.select', slug, `Could not adopt ${slug}`), [runPetRpc])
+  const toggle = (on: boolean) => {
+    void setPetEnabled(requestGateway, on, {
+      noneAvailable: copy.noneAvailable,
+      fallback: on ? copy.turnOnFailed : copy.turnOffFailed
+    }).then(ok => ok && triggerHaptic('crisp'))
+  }
 
-  const removePet = useCallback(
-    (slug: string) => runPetRpc('pet.remove', slug, `Could not uninstall ${slug}`),
-    [runPetRpc]
-  )
-
-  const toggle = useCallback(
-    (on: boolean) => {
-      if (!on) {
-        return runPetRpc('pet.disable', '', 'Could not turn the pet off.')
-      }
-
-      const slug = gallery?.active || gallery?.pets[0]?.slug
-
-      if (!slug) {
-        setError('No pets available to turn on right now.')
-
-        return
-      }
-
-      return selectPet(slug)
-    },
-    [gallery, runPetRpc, selectPet]
-  )
-
-  // Installed pets first, then the rest of the gallery. The petdex catalog is
-  // thousands of entries, so filter by query and cap how many we render.
+  // The petdex catalog is thousands of entries, so rank + cap how many render.
   const RENDER_CAP = 60
-  const needle = query.trim().toLowerCase()
-
-  const filtered = pets.filter(
-    pet =>
-      !/^clawd(-|$)/i.test(pet.slug) &&
-      (!needle || pet.slug.toLowerCase().includes(needle) || pet.displayName.toLowerCase().includes(needle))
-  )
-
-  // petdex has no popularity data, so rank by the signals we do have: the
-  // active pet first, then installed, then curated (official), then the rest.
-  const rank = (pet: GalleryPet) =>
-    Number(enabled && pet.slug === active) * 4 + Number(pet.installed) * 2 + Number(pet.curated)
-
-  const sorted = [...filtered].sort((a, b) => rank(b) - rank(a))
+  const sorted = rankedGalleryPets(gallery, query)
   const shown = sorted.slice(0, RENDER_CAP)
 
   return (
     <div>
-      <SectionHeading icon={PawPrint} title="Pet" />
+      <SectionHeading icon={PawPrint} title={copy.title} />
       <p className="max-w-2xl text-[length:var(--conversation-caption-font-size)] leading-(--conversation-caption-line-height) text-(--ui-text-tertiary)">
-        Adopt an animated petdex mascot that floats over the app and reacts to what Hermes is doing — running while
-        tools execute, celebrating on success, sulking on errors.
+        {copy.intro}
       </p>
 
       {staleBackend && (
         <p className="mt-2 rounded-lg border border-(--ui-stroke-tertiary) bg-(--ui-bg-quinary) px-3 py-2 text-[length:var(--conversation-caption-font-size)] leading-(--conversation-caption-line-height) text-(--ui-text-tertiary)">
-          {RESTART_HINT}
+          {copy.restartHint}
         </p>
       )}
 
       <div className="mt-2">
-        <ListRow
-          action={
-            <SegmentedControl
-              onChange={id => void toggle(id === 'on')}
-              options={[
-                { id: 'off', label: 'Off' },
-                { id: 'on', label: 'On' }
-              ]}
-              value={enabled ? 'on' : 'off'}
-            />
-          }
-          description={
-            enabled && active ? `Showing ${active}.` : 'Turn on to show your mascot in the corner of the window.'
-          }
-          title="Floating mascot"
-        />
-
         <ListRow
           below={
             <>
               <input
                 className="mt-3 w-full rounded-lg border border-(--ui-stroke-tertiary) bg-(--ui-bg-quinary) px-3 py-1.5 text-[length:var(--conversation-caption-font-size)] outline-none placeholder:text-(--ui-text-tertiary) focus:border-(--ui-stroke-secondary)"
                 onChange={event => setQuery(event.target.value)}
-                placeholder="Search pets…"
+                placeholder={copy.searchPlaceholder}
                 spellCheck={false}
                 value={query}
               />
@@ -291,11 +112,11 @@ export function PetSettings() {
               <div className="mt-3 h-72 overflow-y-auto pr-1">
                 {pets.length === 0 ? (
                   <p className="text-[length:var(--conversation-caption-font-size)] text-(--ui-text-tertiary)">
-                    Couldn't reach the petdex gallery. Check your connection and reopen this page.
+                    {copy.unreachable}
                   </p>
                 ) : shown.length === 0 ? (
                   <p className="text-[length:var(--conversation-caption-font-size)] text-(--ui-text-tertiary)">
-                    No pets match "{query}".
+                    {copy.noMatch(query)}
                   </p>
                 ) : (
                   <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-3">
@@ -314,24 +135,29 @@ export function PetSettings() {
                             onClick={() => void selectPet(pet.slug)}
                             type="button"
                           >
-                            <PetThumb alt={pet.displayName} load={loadThumb} slug={pet.slug} url={pet.spritesheetUrl} />
+                            <PetThumb
+                              alt={pet.displayName}
+                              load={(slug, url) => loadPetThumb(requestGateway, slug, url)}
+                              slug={pet.slug}
+                              url={pet.spritesheetUrl}
+                            />
                             <span className="min-w-0 flex-1">
                               <span className="block truncate text-[length:var(--conversation-text-font-size)] font-medium">
                                 {pet.displayName}
                               </span>
                               <span className="block truncate text-[length:var(--conversation-caption-font-size)] text-(--ui-text-tertiary)">
                                 {pet.slug}
-                                {pet.installed ? ' · installed' : pet.curated ? ' · official' : ''}
+                                {pet.installed ? ` · ${copy.installedTag}` : ''}
                               </span>
                             </span>
                             {isBusy && <Loader2 className="size-4 shrink-0 animate-spin text-(--ui-text-tertiary)" />}
                           </button>
                           {pet.installed && !isBusy && (
                             <button
-                              aria-label={`Uninstall ${pet.displayName}`}
+                              aria-label={copy.uninstall(pet.displayName)}
                               className="absolute right-1.5 top-1.5 grid size-6 place-items-center rounded-md bg-(--ui-bg-elevated)/80 text-(--ui-text-tertiary) opacity-0 backdrop-blur-sm transition hover:text-(--ui-red) focus-visible:opacity-100 group-hover:opacity-100"
                               onClick={() => void removePet(pet.slug)}
-                              title={`Uninstall ${pet.displayName}`}
+                              title={copy.uninstall(pet.displayName)}
                               type="button"
                             >
                               <Trash2 className="size-3.5" />
@@ -348,17 +174,57 @@ export function PetSettings() {
                 {error ? (
                   <span className="text-(--ui-red)">{error}</span>
                 ) : sorted.length > RENDER_CAP ? (
-                  `Showing ${RENDER_CAP} of ${sorted.length} — type to narrow it down.`
+                  copy.countCapped(RENDER_CAP, sorted.length)
                 ) : (
-                  `${sorted.length} pet${sorted.length === 1 ? '' : 's'}.`
+                  copy.count(sorted.length)
                 )}
               </p>
             </>
           }
-          description="Picking one installs it (if needed) and makes it active."
-          title="Choose a pet"
+          description={copy.chooseDesc}
+          title={
+            <div className="flex items-center justify-between gap-3">
+              <span>{copy.chooseTitle}</span>
+              <SegmentedControl
+                onChange={id => void toggle(id === 'on')}
+                options={[
+                  { id: 'off', label: copy.off },
+                  { id: 'on', label: copy.on }
+                ]}
+                value={enabled ? 'on' : 'off'}
+              />
+            </div>
+          }
           wide
         />
+
+        {enabled && (
+          <ListRow
+            action={
+              <div className="flex items-center gap-3">
+                <input
+                  aria-label={copy.scaleTitle}
+                  className="h-1 w-40 cursor-pointer appearance-none rounded-full bg-(--ui-stroke-tertiary)"
+                  max={PET_SCALE_MAX}
+                  min={PET_SCALE_MIN}
+                  onChange={event => {
+                    triggerHaptic('selection')
+                    setPetScale(requestGateway, Number(event.target.value))
+                  }}
+                  step={0.05}
+                  style={{ accentColor: 'var(--dt-primary)' }}
+                  type="range"
+                  value={scale}
+                />
+                <span className="w-9 text-right text-[length:var(--conversation-caption-font-size)] tabular-nums text-(--ui-text-tertiary)">
+                  {`${Math.round(scale * 100)}%`}
+                </span>
+              </div>
+            }
+            description={copy.scaleDesc}
+            title={copy.scaleTitle}
+          />
+        )}
       </div>
     </div>
   )
