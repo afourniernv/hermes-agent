@@ -13,6 +13,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
+import requests
+
 logger = logging.getLogger(__name__)
 
 _INIT_FAILED = object()
@@ -56,6 +58,8 @@ class _Settings:
     atif_agent_name: str = "Hermes Agent"
     atif_agent_version: str = "unknown"
     atif_model_name: str = "unknown"
+    inspector_url: str = ""
+    inspector_timeout_seconds: float = 5.0
 
 
 class _Runtime:
@@ -235,6 +239,33 @@ class _Runtime:
             and callable(getattr(getattr(self.nemo_relay, "tools", None), "execute", None))
         )
 
+    def inspector_enabled(self) -> bool:
+        return bool(self.settings.inspector_url)
+
+    def inspect(self, target: dict[str, Any], kwargs: dict[str, Any]) -> dict[str, Any] | None:
+        if not self.inspector_enabled():
+            return None
+        payload = {
+            "target": target,
+            "context": {
+                "sandbox_id": os.environ.get("OPENSHELL_SANDBOX_ID") or None,
+                "scope_id": _session_id(kwargs) or None,
+                "provider": str(kwargs.get("provider") or ""),
+            },
+        }
+        try:
+            response = requests.post(
+                self.settings.inspector_url,
+                json=_jsonable(payload),
+                timeout=self.settings.inspector_timeout_seconds,
+            )
+            response.raise_for_status()
+            body = response.json()
+            return body if isinstance(body, dict) else None
+        except Exception as exc:
+            logger.debug("NeMo Relay inspector call failed: %s", exc, exc_info=True)
+            return None
+
     def execute_llm(self, kwargs: dict[str, Any]) -> Any:
         state = self.ensure_session(kwargs)
         request_body = _jsonable(kwargs.get("request") or {})
@@ -333,6 +364,8 @@ def register(ctx) -> None:
     ctx.register_hook("post_approval_response", on_post_approval_response)
     ctx.register_hook("subagent_start", on_subagent_start)
     ctx.register_hook("subagent_stop", on_subagent_stop)
+    ctx.register_middleware("llm_request", on_llm_request_middleware)
+    ctx.register_middleware("tool_request", on_tool_request_middleware)
     ctx.register_middleware("llm_execution", on_llm_execution_middleware)
     ctx.register_middleware("tool_execution", on_tool_execution_middleware)
 
@@ -513,6 +546,66 @@ def on_subagent_stop(**kwargs: Any) -> None:
         _safe(lambda: runtime.mark_subagent_stop(kwargs))
 
 
+def on_llm_request_middleware(**kwargs: Any) -> Optional[dict[str, Any]]:
+    runtime = _get_runtime()
+    if runtime is None or not runtime.inspector_enabled():
+        return None
+    request = _jsonable(kwargs.get("request") or {})
+    decision = runtime.inspect(
+        {
+            "kind": "llm_request",
+            "provider": str(kwargs.get("provider") or "llm"),
+            "request": request,
+        },
+        kwargs,
+    )
+    if not isinstance(decision, dict):
+        return None
+    if decision.get("kind") != "mutate":
+        return None
+    target = decision.get("target")
+    if not isinstance(target, dict) or target.get("kind") != "llm_request":
+        return None
+    next_request = target.get("request")
+    if not isinstance(next_request, dict):
+        return None
+    return {
+        "request": next_request,
+        "source": "observability/nemo_relay",
+        "reason": "external inspector mutated llm request",
+    }
+
+
+def on_tool_request_middleware(**kwargs: Any) -> Optional[dict[str, Any]]:
+    runtime = _get_runtime()
+    if runtime is None or not runtime.inspector_enabled():
+        return None
+    args = _jsonable(kwargs.get("args") or {})
+    decision = runtime.inspect(
+        {
+            "kind": "tool_request",
+            "tool_name": str(kwargs.get("tool_name") or "tool"),
+            "input": args,
+        },
+        kwargs,
+    )
+    if not isinstance(decision, dict):
+        return None
+    if decision.get("kind") != "mutate":
+        return None
+    target = decision.get("target")
+    if not isinstance(target, dict) or target.get("kind") != "tool_request":
+        return None
+    next_args = target.get("input")
+    if not isinstance(next_args, dict):
+        return None
+    return {
+        "args": next_args,
+        "source": "observability/nemo_relay",
+        "reason": "external inspector mutated tool args",
+    }
+
+
 def on_llm_execution_middleware(**kwargs: Any) -> Any:
     runtime = _get_runtime()
     next_call = kwargs.get("next_call")
@@ -528,6 +621,21 @@ def on_tool_execution_middleware(**kwargs: Any) -> Any:
     runtime = _get_runtime()
     next_call = kwargs.get("next_call")
     args = kwargs.get("args") or {}
+    if runtime is not None and runtime.inspector_enabled():
+        decision = runtime.inspect(
+            {
+                "kind": "tool_request",
+                "tool_name": str(kwargs.get("tool_name") or "tool"),
+                "input": _jsonable(args),
+            },
+            kwargs,
+        )
+        if isinstance(decision, dict) and decision.get("kind") == "deny":
+            return {
+                "error": "blocked by external inspector",
+                "reason": str(decision.get("reason") or "tool request denied"),
+                "findings": _jsonable(decision.get("findings") or []),
+            }
     if runtime is not None and runtime.managed_tool_enabled():
         return runtime.execute_tool(kwargs)
     if callable(next_call):
@@ -577,6 +685,8 @@ def _load_settings() -> _Settings:
         atif_agent_name=_env("HERMES_NEMO_RELAY_ATIF_AGENT_NAME") or "Hermes Agent",
         atif_agent_version=_env("HERMES_NEMO_RELAY_ATIF_AGENT_VERSION") or "unknown",
         atif_model_name=_env("HERMES_NEMO_RELAY_ATIF_MODEL_NAME") or "unknown",
+        inspector_url=_env("HERMES_NEMO_RELAY_INSPECTOR_URL"),
+        inspector_timeout_seconds=_env_float("HERMES_NEMO_RELAY_INSPECTOR_TIMEOUT_SECONDS", 5.0),
     )
 
 
@@ -629,6 +739,16 @@ def _atif_subagent_export_mode() -> str:
 
 def _env_bool(name: str) -> bool:
     return _env(name).lower() in {"1", "true", "yes", "on"}
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = _env(name)
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
 
 
 def _session_id(kwargs: dict[str, Any]) -> str:
