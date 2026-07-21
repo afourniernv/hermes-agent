@@ -627,6 +627,14 @@ def telemetry_provenance(
     """Return the bounded provenance used by shared skill metrics."""
     if is_hub_installed(skill_name) or is_bundled(skill_name):
         return "installed"
+    if ":" in skill_name:
+        try:
+            from hermes_cli.plugins import get_plugin_manager
+
+            if get_plugin_manager().find_plugin_skill(skill_name) is not None:
+                return "installed"
+        except Exception:
+            pass
     if isinstance(record, dict) and record.get("created_by") == "agent":
         return "agent_created"
     if _find_external_skill_dir(skill_name) is not None:
