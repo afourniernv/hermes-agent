@@ -805,6 +805,84 @@ def test_real_binding_correlates_plugin_approval_denial_to_tool_metric(
     assert "sensitive" not in json.dumps(snapshot)
 
 
+def test_real_binding_aggregates_tool_and_approval_timeouts(
+    real_binding_runtime,
+    tmp_path,
+):
+    from hermes_cli.observability.shared_metrics import SharedMetricsStore
+
+    assert real_binding_runtime._native is not None
+    base = {
+        "session_id": "timeout-sensitive-session",
+        "task_id": "timeout-sensitive-task",
+        "turn_id": "timeout-sensitive-turn",
+        "platform": "cli",
+    }
+
+    lifecycle.invoke_hook("on_session_start", **base)
+    lifecycle.invoke_hook("pre_llm_call", **base, messages=["timeout-sensitive-prompt"])
+    lifecycle.invoke_hook(
+        "pre_tool_call",
+        **base,
+        tool_call_id="timeout-sensitive-tool-call",
+        tool_name="terminal",
+        args={"command": "timeout-sensitive-command"},
+    )
+    lifecycle.invoke_hook(
+        "post_approval_response",
+        **base,
+        tool_call_id="timeout-sensitive-tool-call",
+        choice="timeout",
+        command="timeout-sensitive-command",
+    )
+    lifecycle.invoke_hook(
+        "post_tool_call",
+        **base,
+        tool_call_id="timeout-sensitive-tool-call",
+        tool_name="terminal",
+        result={"error": "timeout-sensitive-result"},
+        status="timeout",
+        duration_ms=30_000,
+    )
+    lifecycle.invoke_hook(
+        "on_session_end",
+        **base,
+        completed=False,
+        failed=True,
+        interrupted=False,
+        turn_exit_reason="provider_timeout",
+    )
+    lifecycle.finalize_session(session_id=base["session_id"])
+
+    root = tmp_path / "hermes-home" / "telemetry" / "shared_metrics"
+    snapshot = SharedMetricsStore(
+        root / "metrics.sqlite3",
+        root / "outbox",
+    ).counter_snapshot()
+    [tool_metric] = [
+        counter
+        for counter in snapshot
+        if counter["metric_name"] == "hermes.tool_call.count"
+    ]
+    assert tool_metric["dimensions"] == {
+        "approval_outcome": "timed_out",
+        "latency_bucket": "gte_30s",
+        "outcome": "timed_out",
+        "retry_count_bucket": "unknown",
+        "tool_category": "terminal",
+    }
+    [approval_metric] = [
+        counter
+        for counter in snapshot
+        if counter["metric_name"] == "hermes.tool_approval.count"
+    ]
+    assert approval_metric["dimensions"] == {
+        "attribution": "tool_call",
+        "outcome": "timed_out",
+    }
+    assert "timeout-sensitive" not in json.dumps(snapshot)
+
+
 def test_direct_runtime_is_disabled_by_default(tmp_path, monkeypatch):
     fake = _Relay()
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
