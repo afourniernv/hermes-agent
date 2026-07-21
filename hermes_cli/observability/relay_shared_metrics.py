@@ -249,10 +249,11 @@ class _Runtime:
                 existing.fields = fields
                 existing.attempt_count += 1
                 if task is not None:
-                    if retry_ordinal is None or existing.retry_ordinal is None:
-                        task.retry_count += 1
-                    elif retry_ordinal > existing.retry_ordinal:
-                        task.retry_count += retry_ordinal - existing.retry_ordinal
+                    # Every repeated start for one logical request is another
+                    # physical attempt. Provider fallback resets Hermes's
+                    # provider-local retry ordinal, so ordinal deltas are not a
+                    # reliable task-level retry counter.
+                    task.retry_count += 1
                 if retry_ordinal is not None:
                     existing.retry_ordinal = max(
                         existing.retry_ordinal or 0,

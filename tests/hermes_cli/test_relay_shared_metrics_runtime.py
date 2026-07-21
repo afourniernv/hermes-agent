@@ -1710,6 +1710,63 @@ def test_task_terminal_counts_explicit_retry_with_new_request_id(direct_runtime)
     assert task_end[2]["output"]["retry_count_bucket"] == "1"
 
 
+def test_task_retry_count_survives_provider_fallback_ordinal_reset(direct_runtime):
+    base = {
+        "session_id": "s1",
+        "task_id": "t1",
+        "api_request_id": "r1",
+        "platform": "cli",
+        "provider": "nvidia",
+        "model": "nvidia/nemotron-3-super-120b-a12b",
+    }
+
+    lifecycle.invoke_hook("pre_llm_call", **base)
+    lifecycle.invoke_hook("pre_api_request", **base, retry_count=0)
+    lifecycle.invoke_hook(
+        "api_request_error",
+        **base,
+        retry_count=0,
+        retryable=True,
+    )
+    lifecycle.invoke_hook("pre_api_request", **base, retry_count=1)
+    lifecycle.invoke_hook(
+        "api_request_error",
+        **base,
+        retry_count=1,
+        retryable=True,
+    )
+    lifecycle.invoke_hook(
+        "pre_api_request",
+        **{**base, "provider": "openai", "model": "gpt-5"},
+        retry_count=0,
+    )
+    lifecycle.invoke_hook(
+        "post_api_request",
+        **{**base, "provider": "openai", "model": "gpt-5"},
+        retry_count=0,
+    )
+    lifecycle.invoke_hook(
+        "on_session_end",
+        **base,
+        completed=True,
+        failed=False,
+        interrupted=False,
+        turn_exit_reason="text_response(stop)",
+    )
+    lifecycle.finalize_session(session_id="s1")
+
+    [model_end] = [
+        event for event in direct_runtime.events if event[0] == "llm.call_end"
+    ]
+    assert model_end[2]["retry_count_bucket"] == "2"
+    [task_end] = [
+        event
+        for event in direct_runtime.events
+        if event[0] == "scope.pop" and event[1][1] == "hermes.task_run"
+    ]
+    assert task_end[2]["output"]["retry_count_bucket"] == "2"
+
+
 def test_outer_agent_boundary_closes_early_returns_and_exceptions(
     direct_runtime,
     monkeypatch,
