@@ -2558,6 +2558,61 @@ def test_gateway_and_delegated_entrypoints_flow_through_relay(direct_runtime):
     assert "private-parent-session" not in json.dumps(direct_runtime.events)
 
 
+def test_skill_lifecycle_flows_through_relay_to_a_privacy_safe_package(
+    direct_runtime,
+    tmp_path,
+):
+    common = {
+        "skill_name": "private-skill-name",
+        "provenance": "agent_created",
+    }
+    lifecycle.invoke_hook("on_skill_lifecycle", **common, action="created")
+    lifecycle.invoke_hook(
+        "on_skill_lifecycle",
+        **common,
+        action="loaded",
+        use_count=1,
+        reused=False,
+        reuse_after_patch=False,
+    )
+    lifecycle.invoke_hook("on_skill_lifecycle", **common, action="patched")
+    lifecycle.invoke_hook(
+        "on_skill_lifecycle",
+        **common,
+        action="loaded",
+        use_count=2,
+        reused=True,
+        reuse_after_patch=True,
+    )
+
+    runtime = relay_shared_metrics._get_runtime()
+    assert runtime is not None
+    runtime.shutdown()
+
+    marks = [event for event in direct_runtime.events if event[0] == "scope.event"]
+    assert [event[1] for event in marks] == [
+        "hermes.skill.lifecycle",
+        "hermes.skill.load",
+        "hermes.skill.lifecycle",
+        "hermes.skill.load",
+    ]
+    assert "private-skill-name" not in json.dumps(marks)
+
+    outbox = tmp_path / "hermes-home" / "telemetry" / "shared_metrics" / "outbox"
+    [package_path] = list(outbox.glob("*.json"))
+    package = json.loads(package_path.read_text(encoding="utf-8"))
+    skill_metrics = [
+        metric
+        for metric in package["metrics"]
+        if metric["name"].startswith("hermes.skill.")
+    ]
+    assert {metric["name"] for metric in skill_metrics} == {
+        "hermes.skill.lifecycle.count",
+        "hermes.skill.load.count",
+    }
+    assert "private-skill-name" not in json.dumps(package)
+
+
 def test_persistence_failure_does_not_escape_the_hook(
     direct_runtime,
     monkeypatch,
