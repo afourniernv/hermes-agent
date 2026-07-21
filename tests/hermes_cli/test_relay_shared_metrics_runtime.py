@@ -2613,6 +2613,58 @@ def test_skill_lifecycle_flows_through_relay_to_a_privacy_safe_package(
     assert "private-skill-name" not in json.dumps(package)
 
 
+def test_skill_lifecycle_with_only_task_id_uses_unique_task_scope(direct_runtime):
+    runtime = relay_shared_metrics._get_runtime()
+    assert runtime is not None
+    task = runtime.start_task({
+        "session_id": "session-1",
+        "task_id": "task-1",
+        "platform": "cli",
+    })
+    assert task is not None
+
+    lifecycle.invoke_hook(
+        "on_skill_lifecycle",
+        action="created",
+        skill_name="private-skill-name",
+        provenance="agent_created",
+        task_id="task-1",
+    )
+
+    [mark] = [
+        event
+        for event in direct_runtime.events
+        if event[0] == "scope.event" and event[1] == "hermes.skill.lifecycle"
+    ]
+    assert mark[2]["handle"] == task.handle
+
+
+def test_skill_task_only_correlation_does_not_guess_across_sessions(direct_runtime):
+    runtime = relay_shared_metrics._get_runtime()
+    assert runtime is not None
+    for session_id in ("session-1", "session-2"):
+        assert runtime.start_task({
+            "session_id": session_id,
+            "task_id": "shared-task",
+            "platform": "cli",
+        }) is not None
+
+    lifecycle.invoke_hook(
+        "on_skill_lifecycle",
+        action="created",
+        skill_name="private-skill-name",
+        provenance="agent_created",
+        task_id="shared-task",
+    )
+
+    [mark] = [
+        event
+        for event in direct_runtime.events
+        if event[0] == "scope.event" and event[1] == "hermes.skill.lifecycle"
+    ]
+    assert "handle" not in mark[2]
+
+
 def test_persistence_failure_does_not_escape_the_hook(
     direct_runtime,
     monkeypatch,
