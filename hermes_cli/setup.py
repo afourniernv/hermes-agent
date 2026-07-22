@@ -18,8 +18,9 @@ import re
 import shutil
 import sys
 import copy
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Dict, Any, Callable
+from typing import Optional, Dict, Any, Callable, Literal
 
 from hermes_cli.nous_subscription import get_nous_subscription_features
 from tools.tool_backend_helpers import managed_nous_tools_enabled
@@ -31,6 +32,18 @@ logger = logging.getLogger(__name__)
 PROJECT_ROOT = Path(__file__).parent.parent.resolve()
 
 _DOCS_BASE = "https://hermes-agent.nousresearch.com/docs"
+
+
+@dataclass(frozen=True)
+class _SetupResult:
+    """Internal terminal result preserved until setup metrics are recorded."""
+
+    outcome: Literal["cancelled", "failed", "success"]
+    failure_stage: Literal["execution", "none", "unknown"] = "none"
+
+    @property
+    def succeeded(self) -> bool:
+        return self.outcome == "success"
 
 
 def _model_config_dict(config: Dict[str, Any]) -> Dict[str, Any]:
@@ -725,7 +738,7 @@ def _prompt_container_resources(config: dict):
 
 
 
-def setup_model_provider(config: dict, *, quick: bool = False):
+def setup_model_provider(config: dict, *, quick: bool = False) -> _SetupResult:
     """Configure the inference provider and default model.
 
     Delegates to ``cmd_model()`` (the same flow used by ``hermes model``)
@@ -746,15 +759,19 @@ def setup_model_provider(config: dict, *, quick: bool = False):
     # Delegate to the shared hermes model flow — handles provider picker,
     # credential prompting, model selection, and config persistence.
     from hermes_cli.main import select_provider_and_model
+    result = _SetupResult("success")
+    selection_completed: bool | None = None
     try:
-        select_provider_and_model()
+        selection_completed = select_provider_and_model()
     except (SystemExit, KeyboardInterrupt):
         print()
         print_info("Provider setup skipped.")
+        result = _SetupResult("cancelled", "execution")
     except Exception as exc:
         logger.debug("select_provider_and_model error during setup: %s", exc)
         print_warning(f"Provider setup encountered an error: {exc}")
         print_info("You can try again later with: hermes model")
+        result = _SetupResult("failed", "execution")
 
     # Re-sync the wizard's config dict from what cmd_model saved to disk.
     # This is critical: cmd_model writes to disk via its own load/save cycle,
@@ -780,6 +797,15 @@ def setup_model_provider(config: dict, *, quick: bool = False):
 
     # Tool Gateway prompt is already shown by _model_flow_nous() above.
     save_config(config)
+    if result.succeeded:
+        if selection_completed is False:
+            result = _SetupResult("cancelled", "none")
+        else:
+            from hermes_cli.main import _has_any_provider_configured
+
+            if not _has_any_provider_configured():
+                result = _SetupResult("failed", "unknown")
+    return result
 
 
 # =============================================================================
@@ -2613,7 +2639,7 @@ SETUP_SECTIONS = [
 
 def run_setup_with_metrics(
     mode: str,
-    operation: Callable[[], bool | None],
+    operation: Callable[[], bool | None | _SetupResult],
 ) -> bool:
     """Run one setup entry point with a single terminal metrics outcome."""
     from hermes_cli.observability.relay_shared_metrics import (
@@ -2635,11 +2661,18 @@ def run_setup_with_metrics(
         )
         raise
 
-    succeeded = completed is not False
+    if isinstance(completed, _SetupResult):
+        succeeded = completed.succeeded
+        outcome = completed.outcome
+        failure_stage = completed.failure_stage
+    else:
+        succeeded = completed is not False
+        outcome = "success" if succeeded else "failed"
+        failure_stage = "none" if succeeded else "unknown"
     finish_setup_lifecycle(
         attempt,
-        outcome="success" if succeeded else "failed",
-        failure_stage="none" if succeeded else "unknown",
+        outcome=outcome,
+        failure_stage=failure_stage,
     )
     return succeeded
 
@@ -2729,7 +2762,7 @@ def _run_portal_one_shot(config: dict) -> bool:
     return True
 
 
-def run_setup_wizard(args) -> bool:
+def run_setup_wizard(args) -> bool | _SetupResult:
     """Run the interactive setup wizard.
 
     Supports full, quick, and section-specific setup:
@@ -2807,8 +2840,10 @@ def run_setup_wizard(args) -> bool:
                         Colors.MAGENTA,
                     )
                 )
-                func(config)
+                section_result = func(config)
                 save_config(config)
+                if isinstance(section_result, _SetupResult) and not section_result.succeeded:
+                    return section_result
                 print()
                 print_success(f"{label} configuration complete!")
                 return True
@@ -2913,8 +2948,7 @@ def run_setup_wizard(args) -> bool:
         if setup_mode == 0:
             return _run_first_time_quick_setup(config, hermes_home, is_existing)
         if setup_mode == 2:
-            _run_blank_slate_setup(config, hermes_home, is_existing)
-            return True
+            return _run_blank_slate_setup(config, hermes_home, is_existing)
 
     # ── Full Setup — run all sections ──
     print_header("Configuration Location")
@@ -2932,8 +2966,9 @@ def run_setup_wizard(args) -> bool:
         print_info("or choose to reconfigure if needed.")
 
     # Section 1: Model & Provider
+    model_setup_result = None
     if not (migration_ran and _skip_configured_section(config, "model", "Model & Provider")):
-        setup_model_provider(config)
+        model_setup_result = setup_model_provider(config)
 
     # Section 2: Terminal Backend
     if not (migration_ran and _skip_configured_section(config, "terminal", "Terminal Backend")):
@@ -2960,6 +2995,8 @@ def run_setup_wizard(args) -> bool:
         print_info("If setup changed a value you customized, restore it with:")
         print_info(f"  cp {_backup_path} {config_path}")
     _print_setup_summary(config, hermes_home)
+    if isinstance(model_setup_result, _SetupResult) and not model_setup_result.succeeded:
+        return model_setup_result
     return True
 
 
@@ -3117,7 +3154,9 @@ def _blank_slate_minimize_config(config: dict):
     config.setdefault("display", {})["tool_progress"] = "all"
 
 
-def _run_blank_slate_setup(config: dict, hermes_home, is_existing: bool):
+def _run_blank_slate_setup(
+    config: dict, hermes_home, is_existing: bool
+) -> bool | _SetupResult:
     """Blank Slate setup — start with everything off except the bare minimum.
 
     Forces only the essentials to run an agent (provider + model, the file and
@@ -3145,8 +3184,10 @@ def _run_blank_slate_setup(config: dict, hermes_home, is_existing: bool):
 
     # ── Step 1: Provider & Model (REQUIRED — the agent cannot run without it) ──
     print_header("Step 1 — Provider & Model (required)")
-    setup_model_provider(config)
+    model_setup_result = setup_model_provider(config)
     save_config(config)
+    if not model_setup_result.succeeded:
+        return model_setup_result
 
     # ── Step 2: Terminal backend (where commands run — a core decision) ──
     print_header("Step 2 — Terminal Backend")
@@ -3192,13 +3233,13 @@ def _run_blank_slate_setup(config: dict, hermes_home, is_existing: bool):
         print_info("  Tune agent settings: hermes setup agent")
         print()
         _print_setup_summary(config, hermes_home)
-        return
+        return True
 
     # ── Walkthrough path — opt in to each capability ──
-    _blank_slate_walkthrough(config, hermes_home)
+    return _blank_slate_walkthrough(config, hermes_home)
 
 
-def _blank_slate_walkthrough(config: dict, hermes_home):
+def _blank_slate_walkthrough(config: dict, hermes_home) -> bool:
     """Opt-in walkthrough for Blank Slate: skills, tools, plugins, MCP, gateway."""
     from hermes_cli.config import load_config
 
@@ -3279,6 +3320,7 @@ def _blank_slate_walkthrough(config: dict, hermes_home):
     print()
 
     _print_setup_summary(config, hermes_home)
+    return True
 
 
 def _run_quick_setup(config: dict, hermes_home):

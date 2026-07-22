@@ -79,6 +79,44 @@ def test_cmd_setup_records_a_returned_failure_without_error_details(monkeypatch)
 
 
 @pytest.mark.parametrize(
+    ("terminal", "succeeded"),
+    [
+        pytest.param(("cancelled", "none"), False, id="cancelled"),
+        pytest.param(("failed", "execution"), False, id="failed"),
+        pytest.param(("success", "none"), True, id="success"),
+    ],
+)
+def test_setup_metrics_preserve_explicit_terminal_result(
+    monkeypatch, terminal, succeeded
+):
+    from hermes_cli import setup
+    from hermes_cli.observability import relay_shared_metrics
+
+    attempt = object()
+    finished = []
+    result = setup._SetupResult(*terminal)
+    monkeypatch.setattr(
+        relay_shared_metrics, "start_setup_lifecycle", lambda _: attempt
+    )
+    monkeypatch.setattr(
+        relay_shared_metrics,
+        "finish_setup_lifecycle",
+        lambda value, **kwargs: finished.append((value, kwargs)),
+    )
+
+    assert setup.run_setup_with_metrics("section", lambda: result) is succeeded
+    assert finished == [
+        (
+            attempt,
+            {
+                "outcome": result.outcome,
+                "failure_stage": result.failure_stage,
+            },
+        )
+    ]
+
+
+@pytest.mark.parametrize(
     ("error", "expected_outcome"),
     [
         (RuntimeError("privacy-canary"), "failed"),

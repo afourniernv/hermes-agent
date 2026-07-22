@@ -2963,7 +2963,7 @@ def _is_profile_api_key_provider(provider_id: str) -> bool:
         return False
 
 
-def select_provider_and_model(args=None):
+def select_provider_and_model(args=None) -> bool:
     """Core provider selection + model picking logic.
 
     Shared by ``cmd_model`` (``hermes model``) and the setup wizard
@@ -3286,7 +3286,7 @@ def select_provider_and_model(args=None):
     )
     if provider_idx is None or ordered[provider_idx][0] == "cancel":
         print("No change.")
-        return
+        return False
 
     selected_key = ordered[provider_idx][0]
     selected_members = ordered[provider_idx][2]
@@ -3309,14 +3309,14 @@ def select_provider_and_model(args=None):
         )
         if member_idx is None:
             print("No change.")
-            return
+            return False
         selected_provider = selected_members[member_idx]
     else:
         selected_provider = selected_key
 
     if selected_provider == "aux-config":
         _aux_config_menu()
-        return
+        return True
 
     # Step 2: Provider-specific setup + model selection
     if selected_provider == "openrouter":
@@ -3349,7 +3349,7 @@ def select_provider_and_model(args=None):
                 "Warning: the selected saved custom provider is no longer available. "
                 "It may have been removed from config.yaml. No change."
             )
-            return
+            return False
         _model_flow_named_custom(config, provider_info)
     elif selected_provider == "remove-custom":
         _remove_custom_provider(config)
@@ -3399,6 +3399,7 @@ def select_provider_and_model(args=None):
         "remove-custom",
     } and not selected_provider.startswith("custom:"):
         _clear_stale_openai_base_url()
+    return True
 
 
 def _clear_stale_openai_base_url():
