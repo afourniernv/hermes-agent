@@ -47,6 +47,8 @@ from .shared_metrics_subscriber import SharedMetricsSubscriber
 
 logger = logging.getLogger(__name__)
 
+_FINISHED_TASK_RETENTION = 4096
+
 HANDLED_HOOKS = frozenset({
     "on_session_start",
     "on_session_end",
@@ -126,7 +128,7 @@ class _MetricsSession:
     model_calls: dict[str, _ModelCall] = field(default_factory=dict)
     tasks: dict[str, _TaskRun] = field(default_factory=dict)
     tool_calls: dict[tuple[str, str, str, str], _ToolCall] = field(default_factory=dict)
-    finished_task_ids: set[str] = field(default_factory=set)
+    finished_task_ids: dict[str, None] = field(default_factory=dict)
 
 
 class _Runtime:
@@ -355,6 +357,8 @@ class _Runtime:
         if task is None:
             task = self.start_task(event)
             session = self._task_session(event) if task is not None else None
+            if task_id and task is None:
+                return
         if session is None:
             session = self.ensure_session(event)
         if session is None:
@@ -369,6 +373,8 @@ class _Runtime:
             if session.closing:
                 return
             if task is not None:
+                if session.tasks.get(task.task_id) is not task:
+                    return
                 self._remember_turn(session, task, event)
             existing = session.model_calls.get(request_id)
             if existing is not None:
@@ -436,6 +442,8 @@ class _Runtime:
         with session.lock:
             if session.closing:
                 return
+            if session.tasks.get(task.task_id) is not task:
+                return
             self._remember_turn(session, task, event)
             key = (task_id, *identity)
             if identity in task.completed_tool_call_ids or key in session.tool_calls:
@@ -453,6 +461,8 @@ class _Runtime:
         attribution = "tool_call" if tool_call_id else "unattributed"
         with session.lock:
             if session.closing:
+                return
+            if session.tasks.get(task.task_id) is not task:
                 return
             if tool_call_id:
                 identity = self._tool_call_identity(event)
@@ -488,6 +498,8 @@ class _Runtime:
         tool_call_id = str(event.get("tool_call_id") or "")
         with session.lock:
             if session.closing:
+                return
+            if session.tasks.get(task.task_id) is not task:
                 return
             self._remember_turn(session, task, event)
             if tool_call_id:
@@ -525,6 +537,8 @@ class _Runtime:
         if session is not None and task is not None:
             with session.lock:
                 if session.closing:
+                    return
+                if session.tasks.get(task.task_id) is not task:
                     return
                 self._run_in_task(
                     task,
@@ -958,7 +972,10 @@ class _Runtime:
         task = session.tasks.get(task_id)
         if task is None:
             return
-        session.finished_task_ids.add(task_id)
+        session.finished_task_ids[task_id] = None
+        if len(session.finished_task_ids) > _FINISHED_TASK_RETENTION:
+            oldest_task_id = next(iter(session.finished_task_ids))
+            session.finished_task_ids.pop(oldest_task_id, None)
         self._end_pending_tool_calls(session, task, event)
         self._end_pending_model_calls(session, {**event, "task_id": task_id})
         fields = task_terminal_fields(
