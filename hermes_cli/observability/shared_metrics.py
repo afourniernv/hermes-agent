@@ -413,6 +413,14 @@ class SharedMetricsStore:
         )
         period_end = period_start + timedelta(days=1)
         package_id = str(uuid.uuid4())
+        resource = {
+            "hermes_version": period_row["hermes_version"],
+            "os_family": period_row["os_family"],
+            "architecture": period_row["architecture"],
+            "install_method": period_row["install_method"],
+        }
+        if not client_resource_is_valid(resource):
+            raise ValueError("Unsupported shared-metrics client resource")
         payload = {
             "schema_version": _PACKAGE_SCHEMA_VERSION,
             "package_id": package_id,
@@ -420,12 +428,7 @@ class SharedMetricsStore:
             "period_start": _isoformat(period_start),
             "period_end": _isoformat(period_end),
             "generated_at": _isoformat(now),
-            "resource": {
-                "hermes_version": period_row["hermes_version"],
-                "os_family": period_row["os_family"],
-                "architecture": period_row["architecture"],
-                "install_method": period_row["install_method"],
-            },
+            "resource": resource,
             "metrics": [self._package_metric(row) for row in rows],
         }
         payload_json = json.dumps(

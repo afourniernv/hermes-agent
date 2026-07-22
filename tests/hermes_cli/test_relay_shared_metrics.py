@@ -245,7 +245,11 @@ def test_package_schema_matches_the_client_resource_contract():
     schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
     resource = schema["properties"]["resource"]
 
-    assert set(resource["required"]) == {
+    # Existing v1 outbox entries predate the bounded client dimensions. New
+    # packages always populate every property, while the schema remains able
+    # to validate those immutable queued payloads.
+    assert set(resource["required"]) == {"hermes_version"}
+    assert set(resource["properties"]) == {
         "architecture",
         "hermes_version",
         "install_method",
@@ -1022,6 +1026,54 @@ def test_pending_metrics_keep_the_client_resource_recorded_at_event_time(tmp_pat
     assert all(package["metrics"][0]["value"] == 1 for package in packages)
 
 
+def test_legacy_v1_outbox_package_remains_exportable_and_schema_valid(tmp_path):
+    store = SharedMetricsStore(tmp_path / "metrics.sqlite3", tmp_path / "outbox")
+    package_id = str(uuid.uuid4())
+    payload = {
+        "schema_version": "hermes.shared_metrics.v1",
+        "package_id": package_id,
+        "install_id": str(uuid.uuid4()),
+        "period_start": "2026-07-21T00:00:00Z",
+        "period_end": "2026-07-22T00:00:00Z",
+        "generated_at": "2026-07-22T00:00:00Z",
+        "resource": {"hermes_version": "old-version"},
+        "metrics": [
+            {
+                "name": "hermes.model_call.count",
+                "type": "counter",
+                "dimensions": _dimensions(),
+                "value": 1,
+            }
+        ],
+    }
+    with sqlite3.connect(store.database_path) as connection:
+        connection.execute(
+            """
+            INSERT INTO package_outbox(
+                package_id,
+                period_start,
+                period_end,
+                payload_json,
+                created_at,
+                exported_at
+            ) VALUES (?, ?, ?, ?, ?, NULL)
+            """,
+            (
+                package_id,
+                payload["period_start"],
+                payload["period_end"],
+                json.dumps(payload),
+                payload["generated_at"],
+            ),
+        )
+
+    [package_path] = store.create_and_export_package()
+    exported = json.loads(package_path.read_text(encoding="utf-8"))
+
+    assert exported == payload
+    _schema_validator().validate(exported)
+
+
 def test_store_exports_task_started_and_terminal_counters(tmp_path):
     store = SharedMetricsStore(tmp_path / "metrics.sqlite3", tmp_path / "outbox")
     store.record_counter(
@@ -1105,6 +1157,26 @@ def test_package_builder_rejects_tampered_dimensions(tmp_path):
         )
 
     with pytest.raises(ValueError, match="Unsupported dimensions"):
+        store.create_and_export_package()
+
+    assert list(outbox_directory.glob("*.json")) == []
+
+
+def test_package_builder_rejects_tampered_client_resources(tmp_path):
+    database_path = tmp_path / "metrics.sqlite3"
+    outbox_directory = tmp_path / "outbox"
+    store = SharedMetricsStore(database_path, outbox_directory)
+    store.record_model_call(_dimensions(), _resource())
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "UPDATE counter_aggregates SET os_family = ?",
+            ("privacy-os-canary",),
+        )
+
+    with pytest.raises(
+        ValueError,
+        match="Unsupported shared-metrics client resource",
+    ):
         store.create_and_export_package()
 
     assert list(outbox_directory.glob("*.json")) == []

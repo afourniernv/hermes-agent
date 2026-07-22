@@ -40,10 +40,7 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "hermes_version",
-        "os_family",
-        "architecture",
-        "install_method"
+        "hermes_version"
       ],
       "properties": {
         "hermes_version": {
