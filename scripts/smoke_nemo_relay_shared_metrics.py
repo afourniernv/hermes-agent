@@ -280,6 +280,7 @@ def _validate_store(database_path: Path) -> list[dict[str, Any]]:
     for counter in counters:
         by_name.setdefault(counter["name"], []).append(counter)
     if set(by_name) != {
+        "hermes.client.active",
         "hermes.model_call.count",
         "hermes.skill.lifecycle.count",
         "hermes.skill.load.count",
@@ -289,6 +290,17 @@ def _validate_store(database_path: Path) -> list[dict[str, Any]]:
     }:
         raise AssertionError(
             f"Unexpected SQLite counters:\n{json.dumps(counters, indent=2)}"
+        )
+    if by_name["hermes.client.active"] != [
+        {
+            "name": "hermes.client.active",
+            "dimensions": {},
+            "value": 1,
+            "packaged_value": 1,
+        }
+    ]:
+        raise AssertionError(
+            f"Unexpected client-active counter: {by_name['hermes.client.active']}"
         )
     models = by_name["hermes.model_call.count"]
     if sum(counter["value"] for counter in models) != 2:
@@ -447,6 +459,7 @@ def _validate_packages(
         for metric in package.get("metrics", []):
             metrics.setdefault(metric["name"], []).append(metric)
     if set(metrics) != {
+        "hermes.client.active",
         "hermes.model_call.count",
         "hermes.skill.lifecycle.count",
         "hermes.skill.load.count",
@@ -456,6 +469,17 @@ def _validate_packages(
     }:
         raise AssertionError(
             f"Unexpected package metrics:\n{json.dumps(metrics, indent=2)}"
+        )
+    if metrics["hermes.client.active"] != [
+        {
+            "name": "hermes.client.active",
+            "type": "counter",
+            "dimensions": {},
+            "value": 1,
+        }
+    ]:
+        raise AssertionError(
+            f"Unexpected client-active metric: {metrics['hermes.client.active']}"
         )
     models = metrics["hermes.model_call.count"]
     if sum(metric["value"] for metric in models) != 2:

@@ -14,12 +14,14 @@ SCHEMA_VERSION = "hermes.metrics.event.v1"
 MODEL_CALL_SCOPE = "hermes.model_call"
 TASK_SCOPE = "hermes.task_run"
 TOOL_CALL_SCOPE = "hermes.tool_call"
+CLIENT_ACTIVE_MARK = "hermes.client.active"
 TOOL_APPROVAL_MARK = "hermes.tool_approval"
 SKILL_LIFECYCLE_MARK = "hermes.skill.lifecycle"
 SKILL_LOAD_MARK = "hermes.skill.load"
 SUBSCRIBER_NAME = "hermes.nemo_relay.shared_metrics"
 PRIMARY_MODEL_CALL_ROLE = "primary"
 MODEL_CALL_METRIC = "hermes.model_call.count"
+CLIENT_ACTIVE_METRIC = "hermes.client.active"
 TASK_STARTED_METRIC = "hermes.task_run.started"
 TASK_FINISHED_METRIC = "hermes.task_run.finished"
 TOOL_CALL_METRIC = "hermes.tool_call.count"
@@ -317,6 +319,7 @@ def client_resource_is_valid(resource: Any) -> bool:
 
 
 _COUNTER_DIMENSION_VALUES: dict[str, dict[str, frozenset[str]]] = {
+    CLIENT_ACTIVE_METRIC: {},
     MODEL_CALL_METRIC: {
         "call_role": frozenset({PRIMARY_MODEL_CALL_ROLE}),
         "cost_bucket": MODEL_COST_BUCKETS,
@@ -432,6 +435,22 @@ def _event_metadata_is_valid(event: Any) -> bool:
     return not relay_metadata - {"otel.status_code"} and metadata.get(
         "otel.status_code", "OK"
     ) in {"OK", "ERROR"}
+
+
+def client_active_counter(event: Any) -> tuple[str, dict[str, str]] | None:
+    """Return the active-install counter for one empty allowlisted mark."""
+    if not _event_metadata_is_valid(event):
+        return None
+    if (
+        str(getattr(event, "kind", "") or "") != "mark"
+        or str(getattr(event, "name", "") or "") != CLIENT_ACTIVE_MARK
+        or getattr(event, "category", None) is not None
+        or getattr(event, "scope_category", None) is not None
+        or getattr(event, "category_profile", None) is not None
+        or getattr(event, "data", None) != {}
+    ):
+        return None
+    return CLIENT_ACTIVE_METRIC, {}
 
 
 def model_call_dimensions(event: Any) -> dict[str, str] | None:
