@@ -2168,6 +2168,66 @@ def test_pending_tool_is_closed_and_counted_when_task_is_interrupted(direct_runt
     assert len(task_starts) == 1
 
 
+def test_late_model_start_does_not_create_an_orphan_after_task_completion(
+    direct_runtime,
+):
+    base = {
+        "session_id": "s1",
+        "task_id": "t1",
+        "platform": "cli",
+    }
+    lifecycle.invoke_hook("pre_llm_call", **base)
+    lifecycle.invoke_hook(
+        "on_session_end",
+        **base,
+        completed=True,
+        failed=False,
+        interrupted=False,
+        turn_exit_reason="text_response(stop)",
+    )
+
+    lifecycle.invoke_hook(
+        "pre_api_request",
+        **base,
+        api_request_id="late-request",
+        provider="nvidia",
+        model="nvidia/nemotron-3-super-120b-a12b",
+    )
+    lifecycle.finalize_session(session_id="s1")
+
+    assert [event for event in direct_runtime.events if event[0] == "llm.call"] == []
+    assert [
+        event for event in direct_runtime.events if event[0] == "llm.call_end"
+    ] == []
+
+
+def test_finished_task_retention_is_bounded(direct_runtime, monkeypatch):
+    monkeypatch.setattr(relay_shared_metrics, "_FINISHED_TASK_RETENTION", 2)
+    session_id = "bounded-finished-tasks"
+
+    for index in range(3):
+        event = {
+            "session_id": session_id,
+            "task_id": f"task-{index}",
+            "turn_id": f"turn-{index}",
+            "platform": "cli",
+        }
+        lifecycle.invoke_hook("pre_llm_call", **event)
+        lifecycle.invoke_hook(
+            "on_session_end",
+            **event,
+            completed=True,
+            failed=False,
+            interrupted=False,
+            turn_exit_reason="text_response(stop)",
+        )
+
+    runtime = relay_shared_metrics._get_runtime()
+    assert runtime is not None
+    session = runtime._sessions[session_id]
+    assert list(session.finished_task_ids) == ["task-1", "task-2"]
+
+
 def test_approval_without_tool_context_is_counted_as_unattributed(direct_runtime):
     base = {
         "session_id": "s1",
