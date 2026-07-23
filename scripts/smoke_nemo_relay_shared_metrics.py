@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -22,6 +23,23 @@ RESPONSE_CANARY = "relay-smoke-sensitive-response"
 TOOL_CALL_CANARY = "relay-smoke-sensitive-tool-call"
 TOOL_RESULT_CANARY = "relay-smoke-sensitive-tool-result"
 TOOL_FILE = "relay-smoke-input.txt"
+
+
+def _resolve_hermes_executable(hermes_repo: Path) -> Path:
+    for relative_path in (
+        Path(".venv") / "bin" / "hermes",
+        Path(".venv") / "Scripts" / "hermes.exe",
+    ):
+        candidate = hermes_repo / relative_path
+        if candidate.is_file():
+            return candidate
+    discovered = shutil.which("hermes")
+    if discovered:
+        return Path(discovered)
+    raise SystemExit(
+        "Hermes executable not found in the repository virtual environment "
+        "or on PATH"
+    )
 
 
 class _ModelHandler(BaseHTTPRequestHandler):
@@ -452,9 +470,7 @@ def main() -> int:
     args = _arguments()
     hermes_repo = args.hermes_repo.resolve()
     relay_python = args.relay_python.resolve() if args.relay_python else None
-    hermes = hermes_repo / ".venv" / "bin" / "hermes"
-    if not hermes.is_file():
-        raise SystemExit(f"Hermes executable not found: {hermes}")
+    hermes = _resolve_hermes_executable(hermes_repo)
     if relay_python is not None and not any(
         (relay_python / "nemo_relay").glob("_native.*")
     ):
