@@ -992,7 +992,7 @@ def test_setup_lifecycle_does_not_create_state_before_consent(tmp_path, monkeypa
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(relay_runtime, "_load_nemo_relay", lambda: fake)
     monkeypatch.setattr(
-        "hermes_cli.config.load_config_readonly",
+        "hermes_cli.config.read_raw_config",
         lambda: {"telemetry": {"shared_metrics": {"enabled": False}}},
     )
     relay_shared_metrics._reset_for_tests()
@@ -1821,7 +1821,7 @@ def test_disabling_metrics_during_setup_closes_the_owned_relay_scope(
     monkeypatch.setenv("HERMES_HOME", str(profile))
     monkeypatch.setattr(relay_runtime, "_load_nemo_relay", lambda: fake)
     monkeypatch.setattr(
-        "hermes_cli.config.load_config_readonly",
+        "hermes_cli.config.read_raw_config",
         lambda: {"telemetry": {"shared_metrics": dict(policy)}},
     )
     relay_shared_metrics._reset_for_tests()

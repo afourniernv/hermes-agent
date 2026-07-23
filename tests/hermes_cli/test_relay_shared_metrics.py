@@ -1521,11 +1521,11 @@ def test_retention_prunes_only_expired_exported_history(tmp_path):
     outbox_directory = tmp_path / "outbox"
     store = SharedMetricsStore(database_path, outbox_directory)
 
-    store.record_model_call(_dimensions(), "expired-version")
+    store.record_model_call(_dimensions(), _resource("expired-version"))
     [expired_path] = store.create_and_export_package()
-    store.record_model_call(_dimensions(), "current-version")
+    store.record_model_call(_dimensions(), _resource("current-version"))
     [current_path] = store.create_and_export_package()
-    store.record_model_call(_dimensions(), "pending-version")
+    store.record_model_call(_dimensions(), _resource("pending-version"))
     pending_package = store._create_package()
     assert pending_package is not None
 
@@ -1580,7 +1580,7 @@ def test_retention_failure_does_not_fail_a_committed_export(tmp_path, monkeypatc
         tmp_path / "metrics.sqlite3",
         tmp_path / "outbox",
     )
-    store.record_model_call(_dimensions(), "test-version")
+    store.record_model_call(_dimensions(), _resource())
 
     def fail_pruning():
         raise OSError("retention unavailable")
