@@ -68,7 +68,9 @@ Hermes turn, API, and tool hooks
 Hermes sends an empty `LLMRequest` into the metrics-owned lifecycle. This does
 not describe the separate managed-execution call through the native runtime
 documented above. The terminal metrics event contains only bounded model
-family, provider family, locality, call role, and outcome values. Prompts,
+family, provider family, locality, call role, outcome, total latency,
+input/output token, physical retry, and estimated-cost values. Exact latency,
+token counts, and cost are bucketed before Relay event emission. Prompts,
 responses, exact model IDs, endpoints, errors, session IDs, task IDs, and
 request IDs are not included in the metrics event or package.
 
@@ -123,5 +125,5 @@ The script uses the installed `nemo-relay` dependency by default. Pass
 binding.
 
 The smoke verifies the model request reached the local server, model and task
-counters were stored, one package was exported, and prompt, response, and
-exact-model canaries are absent from the package.
+counters were stored with bounded model measurements, one package was exported,
+and prompt, response, and exact-model canaries are absent from the package.

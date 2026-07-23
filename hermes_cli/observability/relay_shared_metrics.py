@@ -21,6 +21,7 @@ from .shared_metrics_contract import (
     SUBSCRIBER_NAME,
     TASK_SCOPE,
     model_call_fields,
+    model_call_measurement_fields,
     model_call_outcome,
     task_start_fields,
     task_terminal_fields,
@@ -59,6 +60,8 @@ class _ModelCall:
     handle: Any
     task_id: str
     fields: dict[str, str]
+    started_ns: int
+    attempt_count: int = 1
     retry_ordinal: int | None = None
 
 
@@ -244,11 +247,13 @@ class _Runtime:
             existing = session.model_calls.get(request_id)
             if existing is not None:
                 existing.fields = fields
+                existing.attempt_count += 1
                 if task is not None:
-                    if retry_ordinal is None or existing.retry_ordinal is None:
-                        task.retry_count += 1
-                    elif retry_ordinal > existing.retry_ordinal:
-                        task.retry_count += retry_ordinal - existing.retry_ordinal
+                    # Every repeated start for one logical request is another
+                    # physical attempt. Provider fallback resets Hermes's
+                    # provider-local retry ordinal, so ordinal deltas are not a
+                    # reliable task-level retry counter.
+                    task.retry_count += 1
                 if retry_ordinal is not None:
                     existing.retry_ordinal = max(
                         existing.retry_ordinal or 0,
@@ -284,6 +289,7 @@ class _Runtime:
                 handle=handle,
                 task_id=str(event.get("task_id") or ""),
                 fields=fields,
+                started_ns=monotonic_ns(),
                 retry_ordinal=retry_ordinal,
             )
 
@@ -326,6 +332,7 @@ class _Runtime:
                 session,
                 request_id,
                 outcome or model_call_outcome(event),
+                terminal_event=event,
             )
 
     def end_pending_model_calls(self, event: dict[str, Any]) -> None:
@@ -513,10 +520,29 @@ class _Runtime:
         session: _MetricsSession,
         request_id: str,
         outcome: str,
+        *,
+        terminal_event: dict[str, Any] | None = None,
     ) -> None:
         model_call = session.model_calls.pop(request_id, None)
         if model_call is None:
             return
+        retry_count = max(
+            model_call.attempt_count - 1,
+            model_call.retry_ordinal or 0,
+        )
+        measurements = model_call_measurement_fields(
+            terminal_event or {},
+            retry_count=retry_count,
+            fallback_duration_ms=max(
+                0,
+                (monotonic_ns() - model_call.started_ns) // 1_000_000,
+            ),
+        )
+        output = {
+            **model_call.fields,
+            **measurements,
+            "outcome": outcome,
+        }
         try:
             task = session.tasks.get(model_call.task_id)
             if task is not None:
@@ -524,7 +550,7 @@ class _Runtime:
                     task,
                     self.relay.llm.call_end,
                     model_call.handle,
-                    {**model_call.fields, "outcome": outcome},
+                    output,
                     metadata=self._event_metadata(),
                 )
             else:
@@ -532,7 +558,7 @@ class _Runtime:
                     session,
                     self.relay.llm.call_end,
                     model_call.handle,
-                    {**model_call.fields, "outcome": outcome},
+                    output,
                     metadata=self._event_metadata(),
                 )
         except Exception:
@@ -553,7 +579,12 @@ class _Runtime:
         ]
         outcome = "cancelled" if event.get("interrupted") else "failed"
         for request_id in request_ids:
-            self._finish_model_call(session, request_id, outcome)
+            self._finish_model_call(
+                session,
+                request_id,
+                outcome,
+                terminal_event=event,
+            )
 
     def _finish_task(
         self,

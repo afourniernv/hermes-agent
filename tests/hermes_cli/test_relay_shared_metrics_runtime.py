@@ -227,6 +227,10 @@ def test_direct_runtime_records_without_enabling_a_plugin(direct_runtime, tmp_pa
             "model": "claude-sonnet",
             "base_url": "https://api.anthropic.com",
         },
+        api_duration=1.25,
+        usage={"input_tokens": 2_000, "output_tokens": 200},
+        estimated_cost_usd=0.025,
+        cost_status="estimated",
         response={"content": "sensitive-response"},
     )
     lifecycle.invoke_hook(
@@ -259,10 +263,15 @@ def test_direct_runtime_records_without_enabling_a_plugin(direct_runtime, tmp_pa
     assert starts[0][3]["model_name"] == "gpt"
     assert ends[0][2] == {
         "call_role": "primary",
+        "cost_bucket": "0_01_to_0_1",
+        "input_token_bucket": "1k_to_4k",
+        "latency_bucket": "1s_to_2s",
         "locality": "remote",
         "model_family": "claude",
         "outcome": "success",
+        "output_token_bucket": "1_to_1k",
         "provider_family": "direct",
+        "retry_count_bucket": "1",
     }
     serialized_events = json.dumps(direct_runtime.events)
     assert "sensitive-prompt" not in serialized_events
@@ -365,6 +374,10 @@ def test_real_binding_drives_lifecycle_aggregation_export_and_snapshot(
         "post_api_request",
         **success,
         retry_count=1,
+        api_duration=2.5,
+        usage={"input_tokens": 8_000, "output_tokens": 1_000},
+        estimated_cost_usd=0.12,
+        cost_status="estimated",
         response={"content": response_canary},
     )
     lifecycle.invoke_hook(
@@ -386,6 +399,7 @@ def test_real_binding_drives_lifecycle_aggregation_export_and_snapshot(
         **failed,
         retry_count=0,
         retryable=False,
+        api_duration=0.75,
         error={"message": response_canary},
     )
     lifecycle.invoke_hook(
@@ -427,6 +441,26 @@ def test_real_binding_drives_lifecycle_aggregation_export_and_snapshot(
         counter["dimensions"]["outcome"]
         for counter in by_metric["hermes.model_call.count"]
     } == {"success", "failed", "cancelled"}
+    model_by_outcome = {
+        counter["dimensions"]["outcome"]: counter["dimensions"]
+        for counter in by_metric["hermes.model_call.count"]
+    }
+    assert model_by_outcome["success"] == {
+        "call_role": "primary",
+        "cost_bucket": "0_1_to_1",
+        "input_token_bucket": "4k_to_16k",
+        "latency_bucket": "2s_to_5s",
+        "locality": "local",
+        "model_family": "gpt",
+        "outcome": "success",
+        "output_token_bucket": "1_to_1k",
+        "provider_family": "custom",
+        "retry_count_bucket": "1",
+    }
+    assert model_by_outcome["failed"]["latency_bucket"] == "500ms_to_1s"
+    assert model_by_outcome["failed"]["input_token_bucket"] == "unknown"
+    assert model_by_outcome["failed"]["output_token_bucket"] == "unknown"
+    assert model_by_outcome["failed"]["cost_bucket"] == "unknown"
     terminal_by_outcome = {
         counter["dimensions"]["outcome"]: counter
         for counter in by_metric["hermes.task_run.finished"]
@@ -1944,6 +1978,63 @@ def test_task_terminal_counts_explicit_retry_with_new_request_id(direct_runtime)
     ]
     assert task_end[2]["output"]["model_call_count_bucket"] == "2"
     assert task_end[2]["output"]["retry_count_bucket"] == "1"
+
+
+def test_task_retry_count_survives_provider_fallback_ordinal_reset(direct_runtime):
+    base = {
+        "session_id": "s1",
+        "task_id": "t1",
+        "api_request_id": "r1",
+        "platform": "cli",
+        "provider": "nvidia",
+        "model": "nvidia/nemotron-3-super-120b-a12b",
+    }
+
+    lifecycle.invoke_hook("pre_llm_call", **base)
+    lifecycle.invoke_hook("pre_api_request", **base, retry_count=0)
+    lifecycle.invoke_hook(
+        "api_request_error",
+        **base,
+        retry_count=0,
+        retryable=True,
+    )
+    lifecycle.invoke_hook("pre_api_request", **base, retry_count=1)
+    lifecycle.invoke_hook(
+        "api_request_error",
+        **base,
+        retry_count=1,
+        retryable=True,
+    )
+    lifecycle.invoke_hook(
+        "pre_api_request",
+        **{**base, "provider": "openai", "model": "gpt-5"},
+        retry_count=0,
+    )
+    lifecycle.invoke_hook(
+        "post_api_request",
+        **{**base, "provider": "openai", "model": "gpt-5"},
+        retry_count=0,
+    )
+    lifecycle.invoke_hook(
+        "on_session_end",
+        **base,
+        completed=True,
+        failed=False,
+        interrupted=False,
+        turn_exit_reason="text_response(stop)",
+    )
+    lifecycle.finalize_session(session_id="s1")
+
+    [model_end] = [
+        event for event in direct_runtime.events if event[0] == "llm.call_end"
+    ]
+    assert model_end[2]["retry_count_bucket"] == "2"
+    [task_end] = [
+        event
+        for event in direct_runtime.events
+        if event[0] == "scope.pop" and event[1][1] == "hermes.task_run"
+    ]
+    assert task_end[2]["output"]["retry_count_bucket"] == "2"
 
 
 def test_outer_agent_boundary_closes_early_returns_and_exceptions(
