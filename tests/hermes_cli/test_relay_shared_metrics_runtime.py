@@ -1587,6 +1587,7 @@ def test_real_binding_drains_multiple_logical_calls_before_turn_close(
     assert turn.handle is not None
     runtime = lease.host
 
+    handles = []
     for request_id in ("request-1", "request-2"):
         handle = runtime.run_in_session(
             lease.session,
@@ -1597,8 +1598,26 @@ def test_real_binding_drains_multiple_logical_calls_before_turn_close(
             input={},
         )
         turn.logical_llm_calls[request_id] = handle
+        handles.append(handle)
 
-    coordinator.end_turn(turn, outcome="failed")
+    coordinator.complete_logical_call(
+        turn,
+        request_id="request-1",
+        handle=handles[0],
+        outcome="success",
+    )
+    assert list(turn.logical_llm_calls) == ["request-1", "request-2"]
+
+    coordinator.complete_logical_call(
+        turn,
+        request_id="request-2",
+        handle=handles[1],
+        outcome="failed",
+    )
+    assert turn.logical_llm_calls == {}
+    assert turn.logical_llm_outcomes == {}
+
+    coordinator.end_turn(turn, outcome="success")
     coordinator.release_conversation(lease)
     coordinator.finalize_conversation(
         profile_key=profile_key,

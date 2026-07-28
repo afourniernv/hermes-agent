@@ -474,6 +474,7 @@ class RelayTurnContext:
     task_id: str
     handle: Any = None
     logical_llm_calls: dict[str, Any] = field(default_factory=dict, repr=False)
+    logical_llm_outcomes: dict[str, str] = field(default_factory=dict, repr=False)
     logical_llm_lock: threading.RLock = field(
         default_factory=threading.RLock,
         repr=False,
@@ -710,20 +711,48 @@ class RelaySessionCoordinator:
                 return
             self._finish_logical_calls(turn, outcome=outcome)
 
-    @staticmethod
+    def complete_logical_call(
+        self,
+        turn: RelayTurnContext,
+        *,
+        request_id: str,
+        handle: Any,
+        outcome: str,
+    ) -> None:
+        """Close completed logical calls once they reach the stack top."""
+        with turn.finalize_lock:
+            with turn.logical_llm_lock:
+                if turn.logical_llm_calls.get(request_id) is not handle:
+                    return
+                turn.logical_llm_outcomes[request_id] = outcome
+            self._drain_completed_logical_calls(turn)
+
     def _finish_logical_calls(
+        self,
         turn: RelayTurnContext,
         *,
         outcome: str,
     ) -> None:
+        with turn.logical_llm_lock:
+            for request_id in turn.logical_llm_calls:
+                turn.logical_llm_outcomes.setdefault(request_id, outcome)
+        self._drain_completed_logical_calls(turn)
+
+    @staticmethod
+    def _drain_completed_logical_calls(turn: RelayTurnContext) -> None:
         lease = turn.lease
         if not isinstance(lease.host, RelayRuntime) or lease.session is None:
             return
-        with turn.logical_llm_lock:
-            logical_calls = list(turn.logical_llm_calls.items())
-            turn.logical_llm_calls.clear()
-        for index in range(len(logical_calls) - 1, -1, -1):
-            request_id, logical_handle = logical_calls[index]
+        while True:
+            with turn.logical_llm_lock:
+                if not turn.logical_llm_calls:
+                    turn.logical_llm_outcomes.clear()
+                    return
+                request_id = next(reversed(turn.logical_llm_calls))
+                if request_id not in turn.logical_llm_outcomes:
+                    return
+                logical_handle = turn.logical_llm_calls[request_id]
+                outcome = turn.logical_llm_outcomes[request_id]
             try:
                 lease.host.run_in_session(
                     lease.session,
@@ -736,22 +765,15 @@ class RelaySessionCoordinator:
                     },
                 )
             except Exception:
-                with turn.logical_llm_lock:
-                    # Relay scopes are stack-owned. If the newest remaining
-                    # handle cannot close, older handles cannot close safely
-                    # either, so retain the unclosed prefix for diagnostics.
-                    for pending_request_id, pending_handle in logical_calls[
-                        : index + 1
-                    ]:
-                        turn.logical_llm_calls.setdefault(
-                            pending_request_id,
-                            pending_handle,
-                        )
                 logger.warning(
                     "Hermes Relay logical LLM finalization failed",
                     exc_info=True,
                 )
-                break
+                return
+            with turn.logical_llm_lock:
+                if turn.logical_llm_calls.get(request_id) is logical_handle:
+                    turn.logical_llm_calls.pop(request_id, None)
+                    turn.logical_llm_outcomes.pop(request_id, None)
 
     @staticmethod
     def _reset_turn_context(turn: RelayTurnContext) -> None:
