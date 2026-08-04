@@ -2,10 +2,12 @@ import { useStore } from '@nanostores/react'
 import type * as React from 'react'
 import { useEffect, useRef, useState } from 'react'
 
+import { openSession } from '@/app/open-session'
 import {
   closeAllTreeTabs,
   closeOtherTreeTabs,
   closeTreeTabsToRight,
+  reloadTreePane,
   treeTabCloseTargets
 } from '@/components/pane-shell/tree/store'
 import {
@@ -19,14 +21,7 @@ import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
 import { ColorSwatches } from '@/components/ui/color-swatches'
 import { CopyButton } from '@/components/ui/copy-button'
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle
-} from '@/components/ui/dialog'
+import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
 import { renameSession } from '@/hermes'
 import { useI18n } from '@/i18n'
@@ -44,8 +39,8 @@ import {
   setSessions
 } from '@/store/session'
 import { $sessionColorOverrides, setSessionColorOverride } from '@/store/session-color'
-import { $sessionTiles, openSessionTile } from '@/store/session-states'
-import { canOpenSessionWindow, openSessionInNewWindow } from '@/store/windows'
+import { $sessionTiles } from '@/store/session-states'
+import { canOpenSessionWindow } from '@/store/windows'
 
 import type { SessionTitleResponse } from '../../types'
 
@@ -176,8 +171,9 @@ function useSessionActions({
             onSelect: () => {
               triggerHaptic('selection')
               // Stack into the MAIN zone as a tab (center dock; the strip
-              // sticky-shows on gain) — the door to the tab bar.
-              openSessionTile(sessionId, 'center')
+              // sticky-shows on gain) — the door to the tab bar. Focuses first
+              // if the session is already on screen.
+              openSession(sessionId, () => undefined, 'tab')
             }
           })
         ]
@@ -190,7 +186,7 @@ function useSessionActions({
             label: r.newWindow,
             onSelect: () => {
               triggerHaptic('selection')
-              void openSessionInNewWindow(sessionId)
+              openSession(sessionId, () => undefined, 'window')
             }
           })
         ]
@@ -244,12 +240,24 @@ function useSessionActions({
     })
   ]
 
-  // TAB — close verbs that act on the strip (tabs only; a row isn't a tab).
+  // TAB — verbs that act on the strip (tabs only; a row isn't a tab).
   const closeTargets = surface === 'tab' && tabPaneId ? treeTabCloseTargets(tabPaneId) : null
 
-  const tabCloseItems: ActionItemSpec[] =
+  const tabItems: ActionItemSpec[] =
     surface === 'tab'
       ? [
+          ...(tabPaneId
+            ? [
+                spec({
+                  icon: 'refresh',
+                  label: t.zones.reload,
+                  onSelect: () => {
+                    triggerHaptic('selection')
+                    reloadTreePane(tabPaneId)
+                  }
+                })
+              ]
+            : []),
           ...(onClose
             ? [
                 spec({
@@ -347,10 +355,10 @@ function useSessionActions({
       />
       <kit.Separator />
       {workItems.map(item => renderActionItem(kit, item))}
-      {tabCloseItems.length > 0 && (
+      {tabItems.length > 0 && (
         <>
           <kit.Separator />
-          {tabCloseItems.map(item => renderActionItem(kit, item))}
+          {tabItems.map(item => renderActionItem(kit, item))}
         </>
       )}
       <kit.Separator />
@@ -388,17 +396,9 @@ function useSessionActions({
 interface SessionActionsMenuProps
   extends SessionActions, Pick<React.ComponentProps<typeof ActionsMenu>, 'align' | 'sideOffset'> {
   children: React.ReactNode
-  /** Tooltip label for the trigger. */
-  tooltip?: React.ReactNode
 }
 
-export function SessionActionsMenu({
-  children,
-  tooltip,
-  align = 'end',
-  sideOffset = 6,
-  ...actions
-}: SessionActionsMenuProps) {
+export function SessionActionsMenu({ children, align = 'end', sideOffset = 6, ...actions }: SessionActionsMenuProps) {
   const { t } = useI18n()
   const { renameDialog, renderItems } = useSessionActions(actions)
 
@@ -406,11 +406,10 @@ export function SessionActionsMenu({
     <>
       <ActionsMenu
         align={align}
-        ariaLabel={t.sidebar.row.actionsFor(actions.title)}
+        ariaLabel={t.sidebar.row.sessionActions}
         contentClassName="w-40"
         items={renderItems}
         sideOffset={sideOffset}
-        tooltip={tooltip}
       >
         {children}
       </ActionsMenu>
@@ -429,11 +428,7 @@ export function SessionContextMenu({ children, ...actions }: SessionContextMenuP
 
   return (
     <>
-      <ActionsContextMenu
-        ariaLabel={t.sidebar.row.actionsFor(actions.title)}
-        contentClassName="w-40"
-        items={renderItems}
-      >
+      <ActionsContextMenu ariaLabel={t.sidebar.row.sessionActions} contentClassName="w-40" items={renderItems}>
         {children}
       </ActionsContextMenu>
       {renameDialog}
@@ -496,7 +491,6 @@ function RenameSessionDialog({ open, onOpenChange, sessionId, currentTitle, prof
       <DialogContent className="max-w-md">
         <DialogHeader>
           <DialogTitle>{r.renameTitle}</DialogTitle>
-          <DialogDescription>{r.renameDesc}</DialogDescription>
         </DialogHeader>
         <Input
           autoFocus

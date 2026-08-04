@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import time
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, List
@@ -74,7 +73,10 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
             try:
                 if not agent._session_db_created:
                     agent._ensure_db_session()
-                agent._session_db.update_token_counts(
+                # Enqueued for the SessionDB background writer — keeps the
+                # per-call accounting write off the turn thread (see
+                # conversation_loop's queue_token_counts call).
+                agent._session_db.queue_token_counts(
                     agent.session_id,
                     model=agent.model,
                     billing_provider=agent.provider,
@@ -154,7 +156,8 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
         try:
             if not agent._session_db_created:
                 agent._ensure_db_session()
-            agent._session_db.update_token_counts(
+            # Enqueued for the SessionDB background writer (see above).
+            agent._session_db.queue_token_counts(
                 agent.session_id,
                 input_tokens=canonical_usage.input_tokens,
                 output_tokens=canonical_usage.output_tokens,
@@ -1362,12 +1365,6 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                     on_event=_on_event,
                     interrupt_check=_interrupt_or_superseded,
                 )
-                # The terminal SSE frame is contractually last. Request the
-                # end-of-stream marker so Relay can run its response finalizer
-                # and close the physical attempt scope before Hermes returns.
-                if not agent._interrupt_requested:
-                    for _ignored in event_stream:
-                        pass
             except (_httpx.RemoteProtocolError, _httpx.ReadTimeout, _httpx.ConnectError, ConnectionError) as exc:
                 if attempt < max_stream_retries:
                     logger.debug(
@@ -1382,6 +1379,25 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                 if event_stream.final_response is not None:
                     return event_stream.final_response
                 raise
+
+            # A terminal response has already been assembled at this point
+            # (``final`` is built), so a transport error while draining the
+            # rest of the iterator — done only to let Relay run its response
+            # finalizer — must NOT discard it or trigger a new physical
+            # request. Record it as a non-fatal finalization warning and
+            # still return the already-completed, already-billed response.
+            if not agent._interrupt_requested:
+                try:
+                    for _ignored in event_stream:
+                        pass
+                except (_httpx.RemoteProtocolError, _httpx.ReadTimeout, _httpx.ConnectError, ConnectionError) as exc:
+                    logger.warning(
+                        "Codex Responses stream transport finalization failed "
+                        "after a terminal response was already received; "
+                        "returning the completed response instead of "
+                        "retrying. %s error=%s",
+                        agent._client_log_context(), exc,
+                    )
 
             if final.status in {"incomplete", "failed"}:
                 logger.warning(
@@ -1399,7 +1415,20 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                 try:
                     close_fn()
                 except Exception:
-                    pass
+                    # A failed close can leave this response's connection
+                    # checked out of the httpx pool while the caller's finally
+                    # reports a reuse-reason close (e.g. interrupt_check broke
+                    # the event loop with collected output) — caching the
+                    # client with the leaked connection. Poison the slot so
+                    # that close really closes the pool (owner-thread abort;
+                    # mirrors the chat-streaming interrupt-break handling).
+                    # ``client is None`` means the shared primary client,
+                    # which is never reuse-cached and must not have its
+                    # sockets force-shut here.
+                    if client is not None:
+                        agent._abort_request_openai_client(
+                            active_client, reason="codex_stream_close_failed"
+                        )
 
 
 def run_codex_create_stream_fallback(agent, api_kwargs: dict, client: Any = None):

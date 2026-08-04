@@ -15,13 +15,13 @@ from hermes_cli import __version__
 
 from .shared_metrics import SharedMetricsStore
 from .shared_metrics_contract import (
+    MODEL_CALL_PROFILE_MODEL,
     MODEL_CALL_SCOPE,
     SCHEMA_KEY,
     SCHEMA_VERSION,
     SUBSCRIBER_NAME,
     TASK_SCOPE,
     model_call_fields,
-    model_call_outcome,
     task_start_fields,
     task_terminal_fields,
 )
@@ -81,7 +81,7 @@ class _MetricsSession:
     relay_session: relay_runtime.RelaySession
     lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
     closing: bool = False
-    model_calls: dict[str, _ModelCall] = field(default_factory=dict)
+    model_calls: dict[tuple[str, str], _ModelCall] = field(default_factory=dict)
     tasks: dict[str, _TaskRun] = field(default_factory=dict)
 
 
@@ -230,25 +230,26 @@ class _Runtime:
             session = self.ensure_session(event)
         if session is None:
             return
-        request_id = str(event.get("api_request_id") or "")
-        if not request_id:
+        model_call_key = self._new_model_call_key(event)
+        if model_call_key is None:
             return
+        _, request_id = model_call_key
         fields = model_call_fields(event)
         retry_ordinal = _retry_ordinal(event)
-        model_family = fields["model_family"]
         with session.lock:
             if session.closing:
                 return
             if task is not None:
                 self._remember_turn(session, task, event)
-            existing = session.model_calls.get(request_id)
+            existing = session.model_calls.get(model_call_key)
             if existing is not None:
                 existing.fields = fields
                 if task is not None:
-                    if retry_ordinal is None or existing.retry_ordinal is None:
-                        task.retry_count += 1
-                    elif retry_ordinal > existing.retry_ordinal:
-                        task.retry_count += retry_ordinal - existing.retry_ordinal
+                    # Every repeated start for one logical request is another
+                    # physical attempt. Provider fallback resets Hermes's
+                    # provider-local retry ordinal, so ordinal deltas are not a
+                    # reliable task-level retry counter.
+                    task.retry_count += 1
                 if retry_ordinal is not None:
                     existing.retry_ordinal = max(
                         existing.retry_ordinal or 0,
@@ -268,7 +269,7 @@ class _Runtime:
                     self.relay.LLMRequest({}, {}),
                     handle=task.handle,
                     metadata=self._event_metadata(),
-                    model_name=model_family,
+                    model_name=MODEL_CALL_PROFILE_MODEL,
                 )
             else:
                 handle = self._run_in_session(
@@ -278,14 +279,32 @@ class _Runtime:
                     self.relay.LLMRequest({}, {}),
                     handle=session.relay_session.handle,
                     metadata=self._event_metadata(),
-                    model_name=model_family,
+                    model_name=MODEL_CALL_PROFILE_MODEL,
                 )
-            session.model_calls[request_id] = _ModelCall(
+            session.model_calls[model_call_key] = _ModelCall(
                 handle=handle,
                 task_id=str(event.get("task_id") or ""),
                 fields=fields,
                 retry_ordinal=retry_ordinal,
             )
+
+    def record_model_call_error(self, event: dict[str, Any]) -> None:
+        """Retain the latest attempt error without closing the logical call."""
+        session = self._task_session(event, allow_task_id_fallback=True)
+        if session is None:
+            session = self._session(event)
+        if session is None:
+            return
+        with session.lock:
+            if session.closing:
+                return
+            model_call_key = self._existing_model_call_key(session, event)
+            if model_call_key is None:
+                return
+            model_call = session.model_calls.get(model_call_key)
+            if model_call is None:
+                return
+            model_call.fields = model_call_fields(event)
 
     def record_tool_call(self, event: dict[str, Any]) -> None:
         """Count one unique tool invocation under its owning task."""
@@ -307,25 +326,26 @@ class _Runtime:
             else:
                 task.unidentified_tool_calls += 1
 
-    def end_model_call(self, event: dict[str, Any], outcome: str | None = None) -> None:
+    def end_model_call(self, event: dict[str, Any]) -> None:
         session = self._task_session(event, allow_task_id_fallback=True)
         if session is None:
             session = self._session(event)
         if session is None:
             return
-        request_id = str(event.get("api_request_id") or "")
         with session.lock:
             if session.closing:
                 return
-            model_call = session.model_calls.get(request_id)
+            model_call_key = self._existing_model_call_key(session, event)
+            if model_call_key is None:
+                return
+            model_call = session.model_calls.get(model_call_key)
             if model_call is None:
                 return
             fields = model_call_fields(event)
             model_call.fields = fields
             self._finish_model_call(
                 session,
-                request_id,
-                outcome or model_call_outcome(event),
+                model_call_key,
             )
 
     def end_pending_model_calls(self, event: dict[str, Any]) -> None:
@@ -351,7 +371,17 @@ class _Runtime:
         with session.lock:
             if session.closing:
                 return
-            self._finish_task(session, task_id, event)
+            finished = self._finish_task(session, task_id, event)
+        if finished:
+            try:
+                self.relay.subscribers.flush()
+            except Exception:
+                logger.warning(
+                    "Hermes shared-metrics task flush failed",
+                    exc_info=True,
+                )
+            else:
+                self._export()
 
     def close_session(self, event: dict[str, Any]) -> None:
         session = self._session(event)
@@ -380,7 +410,8 @@ class _Runtime:
             self.relay.subscribers.flush()
         except Exception as exc:
             failures.append(f"subscriber flush failed: {exc}")
-        self._export()
+        else:
+            self._export()
         with self._sessions_lock:
             if self._sessions.get(session.session_id) is session:
                 self._sessions.pop(session.session_id, None)
@@ -399,8 +430,15 @@ class _Runtime:
             self._safe(self.close_session, {"session_id": session_id})
         if not self._registered:
             return
-        self._safe(self.relay.subscribers.flush)
-        self._export()
+        try:
+            self.relay.subscribers.flush()
+        except Exception:
+            logger.warning(
+                "Hermes shared-metrics shutdown flush failed",
+                exc_info=True,
+            )
+        else:
+            self._export()
         self._safe(self.relay.subscribers.deregister, self._subscriber_name)
         self.host.release_managed_execution(self._subscriber_name)
         self._registered = False
@@ -511,10 +549,9 @@ class _Runtime:
     def _finish_model_call(
         self,
         session: _MetricsSession,
-        request_id: str,
-        outcome: str,
+        model_call_key: tuple[str, str],
     ) -> None:
-        model_call = session.model_calls.pop(request_id, None)
+        model_call = session.model_calls.pop(model_call_key, None)
         if model_call is None:
             return
         try:
@@ -524,7 +561,7 @@ class _Runtime:
                     task,
                     self.relay.llm.call_end,
                     model_call.handle,
-                    {**model_call.fields, "outcome": outcome},
+                    model_call.fields,
                     metadata=self._event_metadata(),
                 )
             else:
@@ -532,7 +569,7 @@ class _Runtime:
                     session,
                     self.relay.llm.call_end,
                     model_call.handle,
-                    {**model_call.fields, "outcome": outcome},
+                    model_call.fields,
                     metadata=self._event_metadata(),
                 )
         except Exception:
@@ -546,24 +583,51 @@ class _Runtime:
         event: dict[str, Any],
     ) -> None:
         task_id = str(event.get("task_id") or "")
-        request_ids = [
-            request_id
-            for request_id, model_call in session.model_calls.items()
+        model_call_keys = [
+            model_call_key
+            for model_call_key, model_call in session.model_calls.items()
             if not task_id or model_call.task_id == task_id
         ]
-        outcome = "cancelled" if event.get("interrupted") else "failed"
-        for request_id in request_ids:
-            self._finish_model_call(session, request_id, outcome)
+        for model_call_key in model_call_keys:
+            self._finish_model_call(
+                session,
+                model_call_key,
+            )
+
+    @staticmethod
+    def _new_model_call_key(event: dict[str, Any]) -> tuple[str, str] | None:
+        request_id = str(event.get("api_request_id") or "")
+        if not request_id:
+            return None
+        return str(event.get("task_id") or ""), request_id
+
+    @classmethod
+    def _existing_model_call_key(
+        cls,
+        session: _MetricsSession,
+        event: dict[str, Any],
+    ) -> tuple[str, str] | None:
+        key = cls._new_model_call_key(event)
+        if key is None:
+            return None
+        if key in session.model_calls:
+            return key
+        if key[0]:
+            return None
+        candidates = [
+            candidate for candidate in session.model_calls if candidate[1] == key[1]
+        ]
+        return candidates[0] if len(candidates) == 1 else None
 
     def _finish_task(
         self,
         session: _MetricsSession,
         task_id: str,
         event: dict[str, Any],
-    ) -> None:
+    ) -> bool:
         task = session.tasks.get(task_id)
         if task is None:
-            return
+            return False
         self._end_pending_model_calls(session, {**event, "task_id": task_id})
         fields = task_terminal_fields(
             {**task.start_fields, **event},
@@ -592,9 +656,10 @@ class _Runtime:
                     turn_key = (session.session_id, turn_id)
                     if self._turn_sessions.get(turn_key) is session:
                         self._turn_sessions.pop(turn_key, None)
+        return True
 
     def _export(self) -> None:
-        self._safe(self.subscriber.store.create_and_export_package)
+        self._safe(self.subscriber.store.create_and_export_package_if_due)
 
     def _event_metadata(self) -> dict[str, str]:
         return {
@@ -615,12 +680,14 @@ def enabled() -> bool:
     """Return the shared-metrics policy for the active Hermes profile."""
     profile_key = relay_runtime.current_profile_key()
     try:
-        from hermes_cli.config import read_raw_config
+        from hermes_cli.config import read_raw_config_readonly
 
         # Collection consent is profile-owned. Managed config overlays may
         # control runtime policy, but cannot opt a profile into or out of
-        # shared metrics.
-        config = read_raw_config() or {}
+        # shared metrics. Read-only fast path: this gate runs 2-3x per agent
+        # turn, and the mutable read_raw_config() paid a full config deepcopy
+        # on every call.
+        config = read_raw_config_readonly() or {}
     except Exception:
         logger.debug("Unable to read Hermes shared-metrics policy", exc_info=True)
         value = False
@@ -650,6 +717,8 @@ def observe_lifecycle(hook_name: str, **kwargs: Any) -> None:
     """Project one Hermes lifecycle event into the core Relay integration."""
     if not handles_hook(hook_name):
         return
+    if not relay_runtime.relay_instrumentation_enabled():
+        return
     runtime = _get_runtime()
     if runtime is None:
         return
@@ -663,10 +732,9 @@ def observe_lifecycle(hook_name: str, **kwargs: Any) -> None:
         elif hook_name == "post_tool_call":
             runtime.record_tool_call(kwargs)
         elif hook_name == "post_api_request":
-            runtime.end_model_call(kwargs, "success")
+            runtime.end_model_call(kwargs)
         elif hook_name == "api_request_error":
-            if kwargs.get("retryable") is False:
-                runtime.end_model_call(kwargs, "failed")
+            runtime.record_model_call_error(kwargs)
         elif hook_name == "on_session_end":
             runtime.finish_task(kwargs)
         elif hook_name == "subagent_stop":
